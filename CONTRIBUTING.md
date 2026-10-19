@@ -52,6 +52,7 @@ Useful flags:
 - `npm run diagnostics -- --json` : Output machine-readable JSON format
 - `npm run diagnostics -- --skip-network` : Skip external network checks (useful for offline work)
 - `npm run diagnostics -- --strict` : Fail if any warnings are detected
+- `npm run validate:diagnostics` : Run the executable verification suite for success, failure, retry, and authorization paths
 
 5. **Start the development server**
 ```bash

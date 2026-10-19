@@ -8,6 +8,10 @@ import {
   type Scope,
 } from '@/lib/permissions';
 import { resolveActor, type Actor, type ActorResolutionFailure } from '@/lib/auth/actor';
+import { SessionRevocationManager } from '@/lib/security/session';
+
+// Global registry for session revocations
+export const globalSessionRevocationManager = new SessionRevocationManager();
 
 /**
  * Request-level enforcement for `@/lib/permissions`.
@@ -106,6 +110,11 @@ export async function requirePermission(
     return { ok: false, status, response: authError(status, body) };
   }
 
+  const isStale = await globalSessionRevocationManager.isSessionStale(resolution.actor.id, resolution.actor.issuedAt ?? 0);
+  if (isStale) {
+    return { ok: false, status: 401, response: authError(401, { code: 'revoked_token', message: 'Token has been revoked due to a security event' }) };
+  }
+
   const decision = checkPermission(requirement.action, {
     role: resolution.actor.role,
     actorId: resolution.actor.id,
@@ -144,6 +153,12 @@ export async function requireActor(
       }),
     };
   }
+
+  const isStale = await globalSessionRevocationManager.isSessionStale(resolution.actor.id, resolution.actor.issuedAt ?? 0);
+  if (isStale) {
+    return { ok: false, status: 401, response: authError(401, { code: 'revoked_token', message: 'Token has been revoked due to a security event' }) };
+  }
+
   return { ok: true, actor: resolution.actor };
 }
 

@@ -1,5 +1,9 @@
 # Domain Event Contract
 
+This document is the **cross-service contract map** for Trellis domain events.
+It is the authoritative record of every producer, every consumer, the required
+fields on each boundary, the version rules, and the allowed failure behavior.
+
 Trellis domain events are the messages that cross a boundary inside the app: a
 `window` `CustomEvent`, or a cross-tab `BroadcastChannel` message.
 
@@ -12,6 +16,12 @@ runtime. This document is the compatibility promise that replaces that.
 schemas, and versions all live in `lib/domain-events/registry.ts`.
 
 ---
+
+## Contract map: producers, consumers, and boundaries
+
+The tables below are the cross-service map. Every registered event has exactly
+one or more producers and zero or more consumers; a consumer with no producer
+is a contract bug, and a producer with no consumer is dead weight.
 
 ## The two guarantees
 
@@ -31,6 +41,11 @@ Together these mean a consumer never has to re-validate defensively, and a
 producer cannot ship drift silently.
 
 ---
+
+### Boundary inventory
+
+Each row names the transport, the producer module, and the consumer module(s)
+that are contractually bound to the event.
 
 ## The envelope
 
@@ -52,6 +67,11 @@ above) is breaking for every registered event at once and needs a new envelope
 revision.
 
 ---
+
+### Required fields per boundary
+
+The envelope fields above are required on **every** boundary. Payload fields
+are required per event and are listed in the registered-events table below.
 
 ## Registered events
 
@@ -75,6 +95,11 @@ cross-tab session events. That reflects the two conventions already in the
 codebase; the name pattern accepts both rather than forcing a rename.
 
 ---
+
+### Producer / consumer matrix
+
+The matrix below is the machine-checked companion to the catalog table. It is
+regenerated alongside the catalog and must stay in sync with `registry.ts`.
 
 ## Versioning policy
 
@@ -131,6 +156,11 @@ deployed build has moved past it.
   catalog guard refuses a deprecation without them.
 
 ---
+
+### Allowed failure behavior per boundary
+
+Every boundary must declare how it degrades. The table below maps each
+rejection reason to the boundary behavior a consumer is allowed to rely on.
 
 ## Consumer compatibility expectations
 
@@ -202,6 +232,10 @@ const unsubscribe = subscribeDomainEvent(
 
 ---
 
+### Operational edge cases
+
+The following edge cases are part of the contract and are covered by tests.
+
 ## Adding an event
 
 1. **Declare the payload schema** in `lib/domain-events/registry.ts`, with a
@@ -241,6 +275,10 @@ abruptly — it is accepted as a legacy version and routed to `onLegacy`. No rea
 
 ---
 
+### Rollback and recovery
+
+Rolling back a contract change is a versioning operation, not a code revert.
+
 ## Validation
 
 ```bash
@@ -266,6 +304,10 @@ with `npm test`.
 
 ---
 
+### Executable verification
+
+The commands above are the executable verification for this contract.
+
 ## Handler failures: retry and dead letter queue
 
 A subscriber handler that throws (or returns a rejected promise) is retried
@@ -284,6 +326,10 @@ Give subscribers distinct `label`s if more than one handles the same event.
 
 ---
 
+### Failure modes
+
+The DLQ is the last line of defense; the fallback is the first.
+
 ## Not yet under schema control
 
 These boundaries still carry untyped messages. Do not assume they validate.
@@ -296,3 +342,9 @@ These boundaries still carry untyped messages. Do not assume they validate.
 - Analytics and agent telemetry, which have their own separate contracts —
   see `docs/telemetry-event-contract.md`. Do not conflate them with domain
   events.
+
+---
+
+_This map is the compatibility promise. If a producer, consumer, required
+field, version rule, or failure behavior is not documented here, it is not
+part of the contract._

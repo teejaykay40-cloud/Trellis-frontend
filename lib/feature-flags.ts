@@ -1,10 +1,14 @@
 export const FEATURE_FLAGS = {
   stableBugReportPagination: {
     env: "TRELLIS_FEATURE_STABLE_BUG_REPORT_PAGINATION",
+    emergencyEnv: "TRELLIS_FEATURE_STABLE_BUG_REPORT_PAGINATION_EMERGENCY_DISABLED",
+    publicEmergencyEnv: "NEXT_PUBLIC_TRELLIS_FEATURE_STABLE_BUG_REPORT_PAGINATION_EMERGENCY_DISABLED",
     defaultValue: true,
   },
   securityReportExport: {
     env: "TRELLIS_FEATURE_SECURITY_REPORT_EXPORT",
+    emergencyEnv: "TRELLIS_FEATURE_SECURITY_REPORT_EXPORT_EMERGENCY_DISABLED",
+    publicEmergencyEnv: "NEXT_PUBLIC_TRELLIS_FEATURE_SECURITY_REPORT_EXPORT_EMERGENCY_DISABLED",
     defaultValue: false,
   },
 } as const;
@@ -14,6 +18,7 @@ export type FeatureFlag = keyof typeof FEATURE_FLAGS;
 export interface RemoteFeatureFlagConfig {
   enabled: boolean;
   rolloutPercentage?: number;
+  emergencyDisabled?: boolean;
 }
 
 export type RemoteFeatureFlags = Partial<
@@ -23,12 +28,15 @@ export type RemoteFeatureFlags = Partial<
 interface NormalizedFeatureFlagConfig {
   enabled: boolean;
   rolloutPercentage?: number;
+  emergencyDisabled?: boolean;
 }
 
 export interface FeatureFlagPollingOptions {
   url?: string;
   intervalMs?: number;
+  maxRetryIntervalMs?: number;
   fetcher?: typeof fetch;
+  onError?: (error: unknown) => void;
 }
 
 function parseBoolean(value: string | undefined, fallback: boolean): boolean {
@@ -42,6 +50,7 @@ const featureFlagListeners = new Set<() => void>();
 let remoteFeatureFlags: Partial<
   Record<FeatureFlag, NormalizedFeatureFlagConfig>
 > = {};
+const emergencyDisabledFeatureFlags = new Set<FeatureFlag>();
 let stopActivePolling: (() => void) | undefined;
 let storageListenerRegistered = false;
 
@@ -54,20 +63,35 @@ function normalizeConfig(
 ): NormalizedFeatureFlagConfig | undefined {
   if (typeof config === "boolean") return { enabled: config };
   if (typeof config !== "object" || config === null) return undefined;
-  if (typeof config.enabled !== "boolean") return undefined;
+  const validRolloutPercentage =
+    config.rolloutPercentage === undefined ||
+    (typeof config.rolloutPercentage === "number" &&
+      Number.isFinite(config.rolloutPercentage) &&
+      config.rolloutPercentage >= 0 &&
+      config.rolloutPercentage <= 100);
 
   if (
-    config.rolloutPercentage !== undefined &&
-    (typeof config.rolloutPercentage !== "number" ||
-      !Number.isFinite(config.rolloutPercentage) ||
-      config.rolloutPercentage < 0 ||
-      config.rolloutPercentage > 100)
+    config.emergencyDisabled === true &&
+    (typeof config.enabled !== "boolean" || !validRolloutPercentage)
+  ) {
+    return { enabled: false, emergencyDisabled: true };
+  }
+
+  if (typeof config.enabled !== "boolean") return undefined;
+  if (
+    config.emergencyDisabled !== undefined &&
+    typeof config.emergencyDisabled !== "boolean"
   ) {
     return undefined;
   }
 
+  if (!validRolloutPercentage) return undefined;
+
   return {
     enabled: config.enabled,
+    ...(config.emergencyDisabled === undefined
+      ? {}
+      : { emergencyDisabled: config.emergencyDisabled }),
     ...(config.rolloutPercentage === undefined
       ? {}
       : { rolloutPercentage: config.rolloutPercentage }),
@@ -226,6 +250,20 @@ export function updateRemoteFeatureFlags(
   notifyFeatureFlagListeners();
 }
 
+export function setFeatureFlagEmergencyDisabled(
+  flag: FeatureFlag,
+  disabled: boolean,
+): void {
+  const changed = disabled
+    ? !emergencyDisabledFeatureFlags.has(flag)
+    : emergencyDisabledFeatureFlags.has(flag);
+  if (!changed) return;
+
+  if (disabled) emergencyDisabledFeatureFlags.add(flag);
+  else emergencyDisabledFeatureFlags.delete(flag);
+  notifyFeatureFlagListeners();
+}
+
 function getConfiguredPollingUrl(): string | undefined {
   return (
     process.env.NEXT_PUBLIC_TRELLIS_FEATURE_FLAGS_URL ||
@@ -245,6 +283,7 @@ export function startFeatureFlagPolling(
   const controller = new AbortController();
   let isRunning = true;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let consecutiveFailures = 0;
 
   const stop = () => {
     isRunning = false;
@@ -260,26 +299,57 @@ export function startFeatureFlagPolling(
         cache: "no-store",
         signal: controller.signal,
       });
-      if (response.ok) {
-        const payload: unknown = await response.json();
-        if (
-          typeof payload === "object" &&
-          payload !== null &&
-          "flags" in payload &&
-          typeof payload.flags === "object" &&
-          payload.flags !== null
-        ) {
-          updateRemoteFeatureFlags(payload.flags as RemoteFeatureFlags);
-        }
+      if (!response.ok) {
+        throw new Error(`Feature flag endpoint returned HTTP ${response.status}`);
       }
-    } catch {
-      // Keep the last known configuration and retry on the next interval.
+
+      const payload: unknown = await response.json();
+      if (
+        typeof payload !== "object" ||
+        payload === null ||
+        !("flags" in payload) ||
+        typeof payload.flags !== "object" ||
+        payload.flags === null ||
+        Array.isArray(payload.flags)
+      ) {
+        throw new Error("Feature flag endpoint returned an invalid payload");
+      }
+
+      updateRemoteFeatureFlags(payload.flags as RemoteFeatureFlags);
+      consecutiveFailures = 0;
+    } catch (error) {
+      if (!isRunning) return;
+      consecutiveFailures += 1;
+      if (options.onError) options.onError(error);
+      else {
+        console.error(
+          "Feature flag polling failed; retaining the last known configuration.",
+          error,
+        );
+      }
     } finally {
       if (isRunning) {
-        timer = setTimeout(
-          () => void poll(),
-          options.intervalMs ?? FEATURE_FLAG_POLL_INTERVAL_MS,
+        const configuredInterval = options.intervalMs;
+        const baseInterval =
+          configuredInterval !== undefined &&
+          Number.isFinite(configuredInterval) &&
+          configuredInterval > 0
+            ? configuredInterval
+            : FEATURE_FLAG_POLL_INTERVAL_MS;
+        const configuredRetryCap = options.maxRetryIntervalMs;
+        const retryCap = Math.max(
+          baseInterval,
+          configuredRetryCap !== undefined &&
+            Number.isFinite(configuredRetryCap) &&
+            configuredRetryCap > 0
+            ? configuredRetryCap
+            : 5 * 60_000,
         );
+        const retryInterval = Math.min(
+          baseInterval * 2 ** Math.max(0, consecutiveFailures - 1),
+          retryCap,
+        );
+        timer = setTimeout(() => void poll(), retryInterval);
         (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
       }
     }
@@ -296,12 +366,31 @@ export function isFeatureEnabled(
 ): boolean {
   if (getConfiguredPollingUrl()) startFeatureFlagPolling();
 
+  const definition = FEATURE_FLAGS[flag];
+  const publicEmergencyEnv =
+    flag === "stableBugReportPagination"
+      ? process.env.NEXT_PUBLIC_TRELLIS_FEATURE_STABLE_BUG_REPORT_PAGINATION_EMERGENCY_DISABLED
+      : process.env.NEXT_PUBLIC_TRELLIS_FEATURE_SECURITY_REPORT_EXPORT_EMERGENCY_DISABLED;
+  if (
+    parseBoolean(
+      environment[definition.emergencyEnv] ??
+        environment[definition.publicEmergencyEnv] ??
+        publicEmergencyEnv,
+      false,
+    )
+  ) {
+    return false;
+  }
+  if (emergencyDisabledFeatureFlags.has(flag)) return false;
+
+  const remoteConfig = remoteFeatureFlags[flag];
+  if (remoteConfig?.emergencyDisabled) return false;
+
   const override = getFeatureFlagOverride(flag);
   if (override !== null) return override;
 
-  const definition = FEATURE_FLAGS[flag];
   const config =
-    remoteFeatureFlags[flag] ??
+    remoteConfig ??
     normalizeConfig(parseBoolean(environment[definition.env], definition.defaultValue));
   if (!config?.enabled) return false;
   if (config.rolloutPercentage === undefined) return true;

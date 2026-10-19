@@ -26,12 +26,15 @@ export interface Actor {
   role: Role;
   /** Expiry, ms since epoch. */
   expiresAt: number;
+  /** Issued at, ms since epoch. */
+  issuedAt?: number;
 }
 
 const ActorPayloadSchema = z.object({
   sub: z.string().min(1),
   role: z.enum(['guest', 'viewer', 'contributor', 'maintainer', 'admin']),
   exp: z.number().int().positive(),
+  iat: z.number().int().positive().optional(),
 });
 
 const textEncoder = new TextEncoder();
@@ -103,6 +106,7 @@ export async function issueActorToken(
     sub: actor.id,
     role: actor.role,
     exp: now + (options.ttlMs ?? DEFAULT_TTL_MS),
+    iat: now,
   });
   const encoded = base64UrlEncode(textEncoder.encode(JSON.stringify(payload)));
   const signature = base64UrlEncode(await hmac(secret, encoded));
@@ -115,7 +119,8 @@ export type ActorResolutionFailure =
   | 'invalid_signature'
   | 'expired_token'
   | 'unknown_actor'
-  | 'server_misconfigured';
+  | 'server_misconfigured'
+  | 'revoked_token';
 
 export type ActorResolution =
   | { ok: true; actor: Actor }
@@ -183,7 +188,7 @@ export async function verifyActorToken(
 
   return {
     ok: true,
-    actor: { id: parsed.data.sub, role: parsed.data.role, expiresAt: parsed.data.exp },
+    actor: { id: parsed.data.sub, role: parsed.data.role, expiresAt: parsed.data.exp, issuedAt: parsed.data.iat },
   };
 }
 

@@ -12,6 +12,7 @@ import {
   type ExceptionKind,
   type ExceptionSeverity,
 } from "@/lib/operational-health";
+import { buildDependencyFallbacks } from "@/lib/dependency-degradation";
 
 const MINUTE_MS = 60 * 1000;
 const MAX_WINDOW_MINUTES = 24 * 60;
@@ -98,6 +99,7 @@ export async function GET(request: NextRequest) {
     await syntheticProbeManager.runProbes();
   }
   const externalServices = syntheticProbeManager.getAllServicesHealth();
+  const dependencyFallbacks = buildDependencyFallbacks(externalServices);
   const events = getExceptionEvents();
   const exceptionTrend = buildExceptionTrendReport(events, {
     windowMs: windowMinutes * MINUTE_MS,
@@ -113,6 +115,7 @@ export async function GET(request: NextRequest) {
     exceptions: events.slice(-MAX_EVENTS_IN_RESPONSE),
     externalServices,
     syntheticProbes: externalServices,
+    dependencyFallbacks,
   });
 }
 
