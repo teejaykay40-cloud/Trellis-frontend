@@ -145,6 +145,24 @@ describe('denied access', () => {
     }
   });
 
+  it('allows only an explicitly confirmed admin to repair records', () => {
+    for (const role of ROLES) {
+      const decision = checkPermission('repair_records', {
+        role,
+        resourceScope: 'global',
+        context: { confirmed: true },
+      });
+      expect(decision.allowed).toBe(role === 'admin');
+    }
+    expect(
+      checkPermission('repair_records', {
+        role: 'admin',
+        resourceScope: 'global',
+        context: { confirmed: false },
+      }).allowed,
+    ).toBe(false);
+  });
+
   it('denies an admin a retention cleanup that was not explicitly confirmed', () => {
     // `dryRun: true` alone is never enough to reach the delete path.
     const decision = checkPermission('run_retention_cleanup', {

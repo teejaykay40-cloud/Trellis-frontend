@@ -12,6 +12,8 @@ import {
   canonicalJSONJCS,
   canonicalJSONBytes,
   hashCanonicalPayload,
+  domainSeparatedCanonicalJSONBytes,
+  hashDomainSeparatedPayload,
   JCSUnsupportedTypeError,
 } from '@/lib/canonicalization';
 
@@ -382,6 +384,26 @@ describe('RFC 8785 JSON Canonicalization Scheme (JCS)', () => {
   it('hashes the canonical UTF-8 bytes of the RFC 8785 vector', async () => {
     const digest = await hashCanonicalPayload(JSON.parse(RFC8785_INPUT));
     expect(digest).toBe(RFC8785_SHA256);
+  });
+
+  it('separates signed payload bytes and hashes by versioned domain', async () => {
+    const first = domainSeparatedCanonicalJSONBytes('trellis.payment.v1', { b: 2, a: 1 });
+    const reordered = domainSeparatedCanonicalJSONBytes('trellis.payment.v1', { a: 1, b: 2 });
+    const otherDomain = domainSeparatedCanonicalJSONBytes('trellis.session.v1', { a: 1, b: 2 });
+
+    expect(first).toEqual(reordered);
+    expect(first).not.toEqual(otherDomain);
+    await expect(hashDomainSeparatedPayload('trellis.payment.v1', { a: 1, b: 2 }))
+      .resolves.toMatch(/^[0-9a-f]{64}$/);
+    const paymentHash = await hashDomainSeparatedPayload('trellis.payment.v1', { a: 1, b: 2 });
+    const sessionHash = await hashDomainSeparatedPayload('trellis.session.v1', { a: 1, b: 2 });
+    expect(paymentHash).not.toBe(sessionHash);
+  });
+
+  it('rejects ambiguous or unversioned payload domains', () => {
+    expect(() => domainSeparatedCanonicalJSONBytes('', {})).toThrow(/domain/i);
+    expect(() => domainSeparatedCanonicalJSONBytes('Trellis.Payment', {})).toThrow(/domain/i);
+    expect(() => domainSeparatedCanonicalJSONBytes('trellis\0payment', {})).toThrow(/domain/i);
   });
 
   it('produces different hashes for different payloads', async () => {

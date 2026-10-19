@@ -49,6 +49,14 @@ function badge(status) {
   return `${colors.red}[FAIL]${colors.reset}`;
 }
 
+function safeEndpointLabel(endpoint) {
+  try {
+    return new URL(endpoint).origin;
+  } catch {
+    return '[configured endpoint]';
+  }
+}
+
 const DEVELOPMENT_SECRET_PATTERNS = [
   /^your[_-]/i,
   /^change[_-]?me/i,
@@ -139,7 +147,20 @@ export function checkHttpEndpoint(urlStr, timeoutMs = 4000) {
         },
         (res) => {
           res.resume(); // consume response data to free memory
-          if (res.statusCode && res.statusCode < 500) {
+          if (
+            res.statusCode === 401 ||
+            res.statusCode === 403 ||
+            res.statusCode === 429 ||
+            (res.statusCode && res.statusCode >= 500)
+          ) {
+            resolveResult({
+              ok: false,
+              status: res.statusCode,
+              error: res.statusCode === 401 || res.statusCode === 403
+                ? `Authorization denied (HTTP ${res.statusCode})`
+                : `HTTP status ${res.statusCode}`,
+            });
+          } else if (res.statusCode && res.statusCode < 500) {
             resolveResult({ ok: true, status: res.statusCode });
           } else {
             resolveResult({ ok: false, error: `HTTP status ${res.statusCode}` });
@@ -153,10 +174,10 @@ export function checkHttpEndpoint(urlStr, timeoutMs = 4000) {
       });
 
       req.on('error', (err) => {
-        resolveResult({ ok: false, error: err.message });
+        resolveResult({ ok: false, error: err.code ? `Network error (${err.code})` : 'Network request failed' });
       });
     } catch (err) {
-      resolveResult({ ok: false, error: err.message });
+      resolveResult({ ok: false, error: err.code ? `Network error (${err.code})` : 'Network request failed' });
     }
   });
 }
@@ -258,8 +279,12 @@ export function validateEnvRules(envVars) {
   }
 
   const permissionSecret = envVars.PERMISSION_TOKEN_SECRET?.trim();
-  if (permissionSecret && permissionSecret.length < 32) {
-    problems.push('PERMISSION_TOKEN_SECRET must be at least 32 characters when set.');
+  if (
+    permissionSecret &&
+    (permissionSecret.length < 32 ||
+      DEVELOPMENT_SECRET_PATTERNS.some((pattern) => pattern.test(permissionSecret)))
+  ) {
+    problems.push('PERMISSION_TOKEN_SECRET must be a non-placeholder secret of at least 32 characters when set.');
   }
 
   return {
@@ -398,7 +423,7 @@ export function checkConfiguration(options = {}) {
         results.push({
           name: 'API Endpoint (NEXT_PUBLIC_API_URL)',
           status: 'pass',
-          message: `Configured valid URL: ${parsedVars.NEXT_PUBLIC_API_URL}`,
+          message: `Configured valid endpoint: ${safeEndpointLabel(parsedVars.NEXT_PUBLIC_API_URL)}`,
         });
       } catch {
         results.push({
@@ -529,6 +554,26 @@ export function checkDependencies(options = {}) {
     });
   }
 
+  if (pkg && existsSync(nodeModulesPath)) {
+    const declaredPackages = [
+      ...Object.keys(pkg.dependencies || {}),
+      ...Object.keys(pkg.devDependencies || {}),
+    ];
+    const missingPackages = declaredPackages.filter(
+      (dep) => !existsSync(join(nodeModulesPath, ...dep.split('/'), 'package.json'))
+    );
+    results.push({
+      name: 'Declared Project Dependencies',
+      status: missingPackages.length === 0 ? 'pass' : 'fail',
+      message: missingPackages.length === 0
+        ? `All ${declaredPackages.length} declared dependencies are installed`
+        : `Missing declared dependencies: ${missingPackages.join(', ')}`,
+      ...(missingPackages.length > 0
+        ? { remediation: 'Run "npm ci" to install the exact dependencies from package-lock.json.' }
+        : {}),
+    });
+  }
+
   // TypeScript configuration
   const tsconfigPath = join(rootDir, 'tsconfig.json');
   if (existsSync(tsconfigPath)) {
@@ -567,18 +612,26 @@ export async function checkConnectivity(skipNetwork = false, options = {}) {
 
   // Stellar Testnet Horizon
   const horizonEndpoint = options.horizonUrl || 'https://horizon-testnet.stellar.org';
-  const horizonResult = await probeFn(horizonEndpoint);
+  const horizonResult = await probeWithRetry(probeFn, horizonEndpoint, options);
+  const horizonLabel = safeEndpointLabel(horizonEndpoint);
   if (horizonResult.ok) {
     results.push({
       name: 'Stellar Horizon RPC (Testnet)',
       status: 'pass',
-      message: `Successfully connected to ${horizonEndpoint} (HTTP ${horizonResult.status})`,
+      message: `Successfully connected to ${horizonLabel} (HTTP ${horizonResult.status})`,
+    });
+  } else if (horizonResult.status === 401 || horizonResult.status === 403) {
+    results.push({
+      name: 'Stellar Horizon RPC (Testnet)',
+      status: 'warn',
+      message: `Authorization was denied by ${horizonLabel} (HTTP ${horizonResult.status})`,
+      remediation: 'Check whether the configured endpoint requires access credentials and verify them through the approved local credential provider; do not add tokens to URLs or diagnostic output.',
     });
   } else {
     results.push({
       name: 'Stellar Horizon RPC (Testnet)',
       status: 'warn',
-      message: `Unable to reach ${horizonEndpoint}: ${horizonResult.error}`,
+      message: `Unable to reach ${horizonLabel}: ${horizonResult.error}`,
       remediation: 'Check your internet connection or verify firewall/DNS allows outbound traffic to horizon-testnet.stellar.org. Use --skip-network for offline work.',
     });
   }
@@ -588,38 +641,83 @@ export async function checkConnectivity(skipNetwork = false, options = {}) {
     options.sorobanRpcUrl ||
     process.env.OPERATIONAL_HEALTH_RPC_URL ||
     'https://soroban-testnet.stellar.org';
-  const sorobanResult = await probeFn(sorobanEndpoint);
+  const sorobanResult = await probeWithRetry(probeFn, sorobanEndpoint, options);
+  const sorobanLabel = safeEndpointLabel(sorobanEndpoint);
   if (sorobanResult.ok) {
     results.push({
       name: 'Stellar Soroban RPC (Testnet)',
       status: 'pass',
-      message: `Successfully connected to ${sorobanEndpoint} (HTTP ${sorobanResult.status})`,
+      message: `Successfully connected to ${sorobanLabel} (HTTP ${sorobanResult.status})`,
+    });
+  } else if (sorobanResult.status === 401 || sorobanResult.status === 403) {
+    results.push({
+      name: 'Stellar Soroban RPC (Testnet)',
+      status: 'warn',
+      message: `Authorization was denied by ${sorobanLabel} (HTTP ${sorobanResult.status})`,
+      remediation: 'Check whether the configured endpoint requires access credentials and verify them through the approved local credential provider; do not add tokens to URLs or diagnostic output.',
     });
   } else {
     results.push({
       name: 'Stellar Soroban RPC (Testnet)',
       status: 'warn',
-      message: `Unable to reach ${sorobanEndpoint}: ${sorobanResult.error}`,
+      message: `Unable to reach ${sorobanLabel}: ${sorobanResult.error}`,
       remediation: 'Soroban RPC is unreachable; smart contract preflight simulations will fall back to local mock simulation.',
     });
   }
 
   // IPFS Gateway
   const ipfsEndpoint = options.ipfsUrl || 'https://ipfs.io';
-  const ipfsResult = await probeFn(ipfsEndpoint);
+  const ipfsResult = await probeWithRetry(probeFn, ipfsEndpoint, options);
+  const ipfsLabel = safeEndpointLabel(ipfsEndpoint);
   if (ipfsResult.ok) {
     results.push({
       name: 'Public IPFS Gateway',
       status: 'pass',
-      message: `Successfully reached ${ipfsEndpoint} (HTTP ${ipfsResult.status})`,
+      message: `Successfully reached ${ipfsLabel} (HTTP ${ipfsResult.status})`,
+    });
+  } else if (ipfsResult.status === 401 || ipfsResult.status === 403) {
+    results.push({
+      name: 'Public IPFS Gateway',
+      status: 'warn',
+      message: `Authorization was denied by ${ipfsLabel} (HTTP ${ipfsResult.status})`,
+      remediation: 'Check whether the configured gateway requires access credentials and verify them through the approved local credential provider; do not add tokens to URLs or diagnostic output.',
     });
   } else {
     results.push({
       name: 'Public IPFS Gateway',
       status: 'warn',
-      message: `Unable to reach ${ipfsEndpoint}: ${ipfsResult.error}`,
+      message: `Unable to reach ${ipfsLabel}: ${ipfsResult.error}`,
       remediation: 'IPFS gateway is optional for local dev; built-in mock IPFS resolution will be used.',
     });
+  }
+
+  function isRetryableProbeFailure(result) {
+    return result.status === undefined || result.status === 429 || result.status >= 500;
+  }
+
+  function wait(ms) {
+    return new Promise((resolveWait) => setTimeout(resolveWait, ms));
+  }
+
+  async function probeWithRetry(probeFn, endpoint, options = {}) {
+    const maxAttempts = Math.max(1, Math.floor(options.maxAttempts ?? 3));
+    const retryDelayMs = Math.max(0, options.retryDelayMs ?? 250);
+    const waitFn = options.waitFn || wait;
+    let result;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        result = await probeFn(endpoint);
+      } catch {
+        result = { ok: false, error: 'Network probe failed' };
+      }
+      if (result.ok || !isRetryableProbeFailure(result) || attempt === maxAttempts) {
+        return result;
+      }
+      await waitFn(retryDelayMs * 2 ** (attempt - 1));
+    }
+
+    return result;
   }
 
   return results;

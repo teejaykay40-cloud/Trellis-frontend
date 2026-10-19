@@ -69,6 +69,7 @@ describe('streaming-export', () => {
           created_at: '2024-01-01T00:00:00Z',
           parameters: { foo: 'bar' },
           ip_address: '192.168.1.1',
+          unexpected_private_field: 'must not be exported',
         },
         fieldPermissions: permissionMap,
       };
@@ -80,6 +81,7 @@ describe('streaming-export', () => {
       expect(redacted.created_at).toBe('2024-01-01T00:00:00Z');
       expect(redacted.parameters).toEqual({ foo: 'bar' });
       expect(redacted.ip_address).toBe('[REDACTED:MAINTAINER]');
+      expect(redacted).not.toHaveProperty('unexpected_private_field');
       expect(redactedFieldCount).toBe(2);
     });
 
@@ -330,6 +332,62 @@ describe('streaming-export', () => {
 
       expect(metadata.error).toBe('Database connection failed');
     });
+
+    it('retries a failed batch fetch and completes the export', async () => {
+      const chunks: string[] = [];
+      const writer: StreamWriter = (chunk) => { chunks.push(chunk); };
+      let fetchCalls = 0;
+      const fetcher: RecordFetcher = async (offset) => {
+        fetchCalls++;
+        if (fetchCalls === 1) throw new Error('Temporary database failure');
+        if (offset > 0) return [];
+        return [{ data: { id: 'sim-1' }, fieldPermissions: buildPermissionMap('simulations') }];
+      };
+      const request: ExportRequest = {
+        wallet: 'GABC...XYZ',
+        type: 'simulations',
+        format: 'json',
+        role: 'admin',
+        actorId: 'actor-1',
+      };
+
+      const metadata = await streamingExport(
+        request,
+        fetcher,
+        writer,
+        new AbortController().signal,
+        { batchSize: 1, maxRetries: 1, retryDelayMs: 0 },
+      );
+
+      expect(fetchCalls).toBe(3);
+      expect(metadata.error).toBeUndefined();
+      expect(metadata.recordCount).toBe(1);
+      expect(chunks.join('')).toContain('"id":"sim-1"');
+    });
+
+    it('fails after exhausting the configured fetch retries', async () => {
+      const writer: StreamWriter = () => {};
+      const fetcher: RecordFetcher = async () => {
+        throw new Error('Database unavailable');
+      };
+      const request: ExportRequest = {
+        wallet: 'GABC...XYZ',
+        type: 'simulations',
+        format: 'json',
+        role: 'admin',
+        actorId: 'actor-1',
+      };
+
+      const metadata = await streamingExport(
+        request,
+        fetcher,
+        writer,
+        new AbortController().signal,
+        { maxRetries: 2, retryDelayMs: 0 },
+      );
+
+      expect(metadata.error).toBe('Database unavailable');
+    });
   });
 
   describe('large dataset handling', () => {
@@ -487,7 +545,11 @@ describe('streaming-export', () => {
         debug: false,
       };
 
-      expect(ExportConfigSchema.parse(validConfig)).toEqual(validConfig);
+      expect(ExportConfigSchema.parse(validConfig)).toMatchObject({
+        ...validConfig,
+        maxRetries: 2,
+        retryDelayMs: 100,
+      });
     });
 
     it('validates export metadata', () => {
@@ -525,8 +587,8 @@ describe('streaming-export', () => {
           {
             data: {
               id: 'sim-1',
-              description: '=SUM(A1:B10)',
-              notes: '+HYPERLINK("http://evil.com")',
+              results: '=SUM(A1:B10)',
+              user_agent: '+HYPERLINK("http://evil.com")',
             },
             fieldPermissions: buildPermissionMap('simulations'),
           },

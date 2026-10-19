@@ -118,3 +118,81 @@ The `OperationalMetadataRetentionStore` manages metadata lifecycle:
 - **Restoring Dropped Metadata**: Minimization is applied at ingestion defense-in-depth; to roll back minimization policies, adjust `ALLOWED_PAYLOAD_FIELDS` in `lib/telemetry/minimizationReview.ts` to accommodate newly standardized contract fields.
 - **Rollback**: Changes to classification rules and retention store remain fully backwards compatible with `TelemetryEvent` and legacy subscriber hooks. Reverting commits restores previous passthrough behavior without requiring database or migration runs.
 
+## Cross-Service Contract Map
+
+This section maps every domain event producer to its consumers, the required fields for each event type, the version rules that govern changes, and the allowed failure behavior at each integration boundary.
+
+### Producer/Consumer Matrix
+
+| Event type | Producer | Consumers | Required fields | Optional fields |
+| --- | --- | --- | --- | --- |
+| `heartbeat` | Client telemetry stream (`useTelemetryStream`) | Dashboard live view, Prometheus exporter | id, ts, agentRef, type, severity | correlationId, state |
+| `status` | Client telemetry stream | Dashboard live view, Prometheus exporter | id, ts, agentRef, type, severity | correlationId, taskKind, state |
+| `error` | Client telemetry stream, wallet adapter | Dashboard live view, Prometheus exporter, retention store | id, ts, agentRef, type, severity, code | correlationId, taskKind, state, message |
+| `task_started` | Client telemetry stream, wallet adapter, arena loader | Dashboard live view, Prometheus exporter, retention store | id, ts, agentRef, type, severity, correlationId, taskKind | code, message |
+| `task_completed` | Client telemetry stream, wallet adapter, arena loader | Dashboard live view, Prometheus exporter, retention store | id, ts, agentRef, type, severity, correlationId, taskKind, state | code, message |
+
+### Version Rules
+
+Every event is governed by the following rules. They are enforced by the contract tests in `tests/telemetry/contract-map.ts`.
+
+1. **Additive changes are minor versions.** Adding a new optional payload field or a new `taskKind` value is backward compatible and does not require a consumer release.
+2. **Required field additions are major versions.** A new required field or a new event `type` must be added to this document and to the contract test before any producer emits it. Consumers must tolerate unknown fields by ignoring them.
+3. **Removing a field or type is a major version.** Removal requires a migration note in this document and a deprecation window of at least one release cycle.
+4. **Severity and code values are closed enums.** New values require a documentation update and a consumer test before being emitted.
+5. **Consumers must not fail closed on unknown fields.** Unknown payload keys are dropped by minimization rather than rejecting the event.
+
+### Allowed Failure Behavior
+
+| Boundary | Failure mode | Allowed behavior |
+| --- | --- | --- |
+| Producer -> client stream | Event exceeds 30 events/second or 500 event buffer | Drop excess events from the dashboard view; do not throw or block the producer. |
+| Producer -> client stream | Malformed or unknown payload fields | Drop the field during minimization; keep the event if required fields are present. |
+| Client stream -> WebRTC | ICE failure, no peer, WebRTC unsupported | Fall back to WebSocket with the same event contract; expose fallback reason. |
+| Client stream -> WebSocket | Socket closes or errors | Reconnect with backoff; buffer up to the retention limit and drop oldest events. |
+| Metric exporter -> OTLP collector | Endpoint unset or unreachable | Buffer without transmitting; do not block the UI. |
+| Metric exporter -> OTLP collector | Non-20x x response or timeout | Retain batch for the next interval; drop after the buffer limit. |
+| Dashboard -> Prometheus | Response exceeds 200 series or 1,000 points/series | Truncate to the caps and surface a truncation indicator. |
+| Retention store | Tier capacity exceeded | Evict oldest record in the tier and audit `quota_exceeded`. |
+| Retention store | Clock skew or time jump | Use monotonic elapsed time where available; store UTC expiration stamps. |
+
+### Event Lifecycle Example
+
+A wallet sign operation emits the following sequence, which the contract test asserts is well-formed and minimized:
+
+```
+task_started   { correlationId: "c1", taskKind: "wallet_sign", state: "started" }
+task_completed { correlationId: "c1", taskKind: "wallet_sign", state: "succeeded" }
+```
+
+A wallet sign failure emits `task_completed` with `state: "failed"` and a code from the closed enum (for example, `user_rejected`). The correlation ID is opaque and must not be a address, transaction hash, or user identifier.
+
+### Executable Verification
+
+The contract map is verified by `tests/telemetry/contract-map.ts`, which:
+
+1. Asserts that every event type in the matrix has a defined producer and at least one consumer.
+2. Asserts that every required field is present on a sample event of that type.
+3. Asserts that unknown payload fields are dropped by `reviewAndMinimizeMetadata` without throwing.4. Asserts that consumers ignore unknown fields rather than failing closed.
+5. Asserts that the allowed failure behavior for each boundary matches the table above.
+
+Run the verification with:
+
+```
+npm test - tests/telemetry/contract-map.ts
+
+```
+
+### Operational Edge Cases for the Contract Map
+
+1. **Producer ships a new optional field without a doc update**: The field is dropped at ingestion by the minimization allowlist until the document and test are updated. No consumer breaks.
+2. **Consumer receives an event type it does not know**: The consumer must ignore the event and continue processing. This is the default behavior for the dashboard and the exporter.
+3. **WebRTC connection degrades mid-stream**: The client falls back to WebSocket and replays the buffered events up to the retention limit. The event contract is identical on both transports.
+4. **OTLP collector returns an error**: The exporter retains the batch for the next interval and drops it after the buffer limit. No event is lost from the local dashboard view.
+5. **Retention store evicts a record due to capacity**: An audit record with reason `quota_exceeded` is written so operators can correlate the loss.
+
+### Rollback and Recovery for the Contract Map
+
+- **Rollback a new event type**: Remove the entry from the matrix and the corresponding test case. Producers that still emit the type will have it ignored by consumers.
+- **Rollback a new required field**: Revert the producer and consumer changes together. The minimization allowlist will drop the field until the document is updated.
+- **Recovery from a broken consumer**: Reload the dashboard or reconnect the stream; no data migration is required because the contract is enforced at ingestion and render time.

@@ -125,6 +125,29 @@ Treat warnings as failures in pre-release pipelines:
 npm run drill:verify -- --strict
 ```
 
+### 5. Generate Rare-Path Fixtures
+Generate a deterministic synthetic bundle for success, terminal failure, transient retry,
+authorization, and partial-side-effect recovery paths:
+```bash
+node scripts/fixtures/generate-rare-path-fixtures.mjs --seed incident-2026-01
+```
+
+The JSON is written to stdout and contains a schema version, stable synthetic operation
+IDs, idempotency keys, attempt histories, and expected outcomes. The generator does not
+write fixture files, contact services, or mutate application state. Verify the scenario
+coverage and invariants with:
+```bash
+npm run test:rare-path-fixtures
+```
+
+Use these fixtures in isolated tests and staging drills only. A changed seed produces
+different synthetic IDs; keep a seed fixed when reproducing a reported failure. Never
+put real wallet addresses, tokens, signatures, or production payloads in a seed or
+fixture. If fixture expectations drift after an intentional contract change, update the
+generator and its executable assertions together, and preserve the previous contract
+until its consumers have migrated. To roll back an incompatible fixture update, revert
+the generator/test change; there are no generated persistent files to clean up.
+
 ---
 
 ## Operational Edge Cases & Failure Modes

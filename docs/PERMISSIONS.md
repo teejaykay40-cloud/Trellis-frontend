@@ -65,7 +65,21 @@ run_retention_cleanup: {
     guest: DENY,
   },
 },
+repair_records: {
+  description: 'Repair orphaned or inconsistent derived records',
+  grants: {
+    admin: { scope: 'global', conditions: [{ type: 'requires_confirmation' }] },
+    maintainer: DENY,
+    contributor: DENY,
+    viewer: DENY,
+    guest: DENY,
+  },
+},
 ```
+
+`repair_records` is the authorization gate for the projection reconciliation
+repair job. It is admin-only and requires explicit confirmation; starting and
+resuming checkpointed repairs both re-check authorization.
 
 `PERMISSION_MATRIX` is that declaration expanded to one entry per action per
 role. Because `MATRIX` is typed `Record<Action, ActionDefinition>`, adding an
@@ -178,6 +192,33 @@ if (!decision.allowed) return deniedResponse(decision);
 `deniedResponse` builds the same `403` shape as `requirePermission`, so the two
 paths cannot drift.
 
+## Privacy-safe exports
+
+`POST /api/export` keeps its existing request body, response formats, and
+`schemaVersion: "2.0"` metadata contract. The server derives the caller's role
+from the signed actor token; a role supplied in the body is not accepted. The
+export projection is an allowlist: only fields registered for the selected
+export type can appear. Registered fields are redacted according to the
+caller's role, while unregistered source fields are omitted even for admins.
+When fields are absent from a record, JSON omits them and CSV leaves the
+corresponding registered column blank.
+
+Batch fetches retry twice by default with a 100 ms delay. After retries are
+exhausted, or if the stream writer fails, the response stream fails rather than
+being closed as a successful partial download. A cancelled request is not
+retried once its abort signal is observed. Clients should discard a failed or
+cancelled download and retry the whole request; exports do not support
+checkpoints or resuming from a record offset. An empty successful export remains
+a valid empty JSON array or header-only CSV document.
+
+For recovery, first restore connectivity to the export's data source and retry
+the request. If a deployment must be rolled back, keep the previous endpoint
+disabled until it has the allowlisted projection and failure propagation too;
+rolling back to a version that copies raw records can reintroduce field leaks.
+No stored export data needs cleanup because responses are streamed and not
+persisted by this endpoint. The existing API contract is retained, so clients
+do not need a migration.
+
 ## Configuration
 
 ```bash
@@ -190,6 +231,51 @@ paths cannot drift.
 The privileged routes fail closed without it: an unset secret returns `500`,
 never a default role. Rotating it invalidates every outstanding token
 immediately, so users must re-authenticate.
+
+## Expiring capabilities for sensitive actions
+
+Live retention cleanup requires both the usual signed actor bearer token and a
+short-lived capability token:
+
+1. An authorized admin requests `POST /api/permissions/capability` with
+   `{ "action": "run_retention_cleanup", "dryRun": false, "dataClasses": [...] }`.
+   The `dataClasses` field may be omitted to target all configured classes.
+2. The server rechecks `run_retention_cleanup` at global scope, then returns a
+   capability in a `Cache-Control: no-store` response. It expires after two
+   minutes (the issuer enforces a one-to-five-minute lifetime).
+3. Send that token in `X-Capability-Token` with the same actor bearer token and
+   the exact same cleanup request to `POST /api/retention/run`.
+
+The capability signature covers its actor, action, expiry, unique identifier,
+and a hash of the canonical request. Changing or adding/removing a data class,
+changing `dryRun`, or using another actor invalidates it. It authorizes no other
+endpoint or action. It is intentionally retryable for the same exact request
+until expiry, so a lost response can be retried without silently broadening
+authority; it is not single-use and does not provide transaction-level
+idempotency. The downstream cleanup must preserve its own idempotency if it can
+partially apply before failing.
+
+Dry runs are unchanged and need only the actor token. Existing actor token
+issuance/verification contracts do not change. For clients that previously
+sent live cleanup requests directly, the migration is to request a capability
+first and send its returned token in `X-Capability-Token`; missing capabilities
+return `428`, mismatched actor/request returns `403`, invalid/expired tokens
+return `401`, and server secret misconfiguration returns `500`.
+
+### Operational recovery
+
+- If a capability expires before use, request a new one; do not increase token
+  lifetime or log/store tokens to work around expiry.
+- If a request mismatch is returned, discard that token and request a new one
+  for the reviewed target set. Do not retry with modified targets.
+- If issuance returns `500`, check that `PERMISSION_TOKEN_SECRET` is present
+  and at least 32 characters, then restart/redeploy the server with the
+  corrected secret. Secret rotation invalidates all actor and capability
+  tokens; clients must re-authenticate and obtain new capabilities.
+- On rollback, restore the previous server release and update clients to stop
+  using capability issuance. Do not remove the actor permission check from
+  live retention cleanup; it remains mandatory. This rollback restores the
+  prior request contract but also removes the additional capability gate.
 
 ## Introspection
 

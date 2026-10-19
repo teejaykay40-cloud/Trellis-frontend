@@ -39,6 +39,8 @@ import {
   buildIdempotencyRateSeries,
   duplicateRequestRate,
 } from '@/lib/idempotency';
+import type { DependencyFallbackGuidance } from '@/lib/dependency-degradation';
+import { buildDependencyFallbacks } from '@/lib/dependency-degradation';
 import { useApiMetricsStore } from '@/store/apiMetricsStore';
 import { DeadLetterPanel } from './DeadLetterPanel';
 import { SideEffectDeadLetterPanel } from './SideEffectDeadLetterPanel';
@@ -72,6 +74,7 @@ type FilterState = {
 type HealthResponse = OperationalHealth & {
   exceptions?: ExceptionEvent[];
   externalServices?: ExternalServiceHealth[];
+  dependencyFallbacks?: DependencyFallbackGuidance[];
 };
 
 function uniqueValues(events: readonly ExceptionEvent[], key: keyof FilterState): string[] {
@@ -90,8 +93,10 @@ function groupLabel(dimension: string): string {
 export default function OperationsDashboardPage() {
   const [health, setHealth] = useState<OperationalHealth | null>(null);
   const [externalServices, setExternalServices] = useState<ExternalServiceHealth[]>([]);
+  const [dependencyFallbacks, setDependencyFallbacks] = useState<DependencyFallbackGuidance[]>([]);
   const [exportStatusMessage, setExportStatusMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [healthReloadToken, setHealthReloadToken] = useState(0);
   const [mounted, setMounted] = useState(false);
   const [now, setNow] = useState<number | null>(null);
   const [windowMinutes, setWindowMinutes] = useState<number>(60);
@@ -167,6 +172,9 @@ export default function OperationsDashboardPage() {
         setError(null);
         if (Array.isArray(data.exceptions)) setExceptionEvents(data.exceptions);
         if (Array.isArray(data.externalServices)) setExternalServices(data.externalServices);
+        setDependencyFallbacks(Array.isArray(data.dependencyFallbacks)
+          ? data.dependencyFallbacks
+          : buildDependencyFallbacks(data.externalServices ?? []));
       })
       .catch((requestError: Error) => {
         if (!cancelled) setError(requestError.message);
@@ -608,6 +616,39 @@ export default function OperationsDashboardPage() {
             </p>
           </>
         )}
+
+        <section aria-labelledby="dependency-fallbacks-heading" className="mt-10 rounded-lg border border-trellis-vine/30 bg-trellis-vine/10 p-5" data-testid="dependency-fallbacks">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <h2 id="dependency-fallbacks-heading" className="text-2xl font-bold">External dependency status</h2>
+              <p className="mt-1 max-w-3xl text-sm text-gray-400">
+                Safe user messaging and operator recovery guidance when a provider is degraded. Provider URLs and raw probe errors are not shown.
+              </p>
+            </div>
+            <span className="text-sm text-gray-400" role="status" aria-live="polite">
+              {externalServices.filter((service) => service.status === 'healthy').length} of {externalServices.length} healthy
+            </span>
+          </div>
+          {dependencyFallbacks.length === 0 ? (
+            <p className="mt-4 rounded border border-green-500/30 bg-green-500/10 p-3 text-sm text-green-200">
+              All monitored external dependencies are healthy.
+            </p>
+          ) : (
+            <ul className="mt-4 grid gap-3 md:grid-cols-2">
+              {dependencyFallbacks.map((guidance) => (
+                <li key={guidance.service} className="rounded border border-yellow-500/40 bg-yellow-500/10 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <h3 className="font-semibold text-white">{guidance.label}</h3>
+                    <span className="rounded-full bg-yellow-500/20 px-2 py-1 text-xs font-bold uppercase text-yellow-200">{guidance.status}</span>
+                  </div>
+                  <p className="mt-3 text-sm text-gray-200">{guidance.userMessage}</p>
+                  <p className="mt-3 text-sm text-gray-300"><span className="font-semibold text-white">User fallback:</span> {guidance.fallback}</p>
+                  <p className="mt-2 text-sm text-gray-400"><span className="font-semibold text-gray-200">Recovery:</span> {guidance.recovery}</p>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
 
         {report && report.breaches.length > 0 && (
           <section role="alert" aria-live="assertive" aria-labelledby="breach-heading" className="mt-10 space-y-3">

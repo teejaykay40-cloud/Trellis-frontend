@@ -497,6 +497,32 @@ export function canonicalJSONBytes(
   return new TextEncoder().encode(jcsCanonicalize(input, options));
 }
 
+/**
+ * Encode canonical payload bytes with an explicit protocol/domain prefix.
+ *
+ * Reusing the same JSON payload for two different signatures or replay
+ * domains must not produce the same signed bytes. Include a versioned domain
+ * such as `trellis.payment.v1` at the call site; the prefix is unambiguous and
+ * the JSON body remains RFC 8785 canonical.
+ */
+export function domainSeparatedCanonicalJSONBytes(
+  domain: string,
+  input: unknown,
+  options: JCSCanonicalizeOptions = {}
+): Uint8Array {
+  if (!/^[a-z0-9][a-z0-9._:/-]{0,127}$/.test(domain)) {
+    throw new Error('Canonical payload domain must be a non-empty lowercase ASCII identifier (max 128 characters)');
+  }
+
+  const encoder = new TextEncoder();
+  const prefix = encoder.encode(`trellis-signed-payload\0${domain}\0`);
+  const body = canonicalJSONBytes(input, options);
+  const result = new Uint8Array(prefix.length + body.length);
+  result.set(prefix, 0);
+  result.set(body, prefix.length);
+  return result;
+}
+
 function getSubtleCrypto(): SubtleCrypto {
   const webcrypto = globalThis.crypto;
   if (webcrypto && webcrypto.subtle) {
@@ -525,6 +551,21 @@ export async function hashCanonicalPayload(
 ): Promise<string> {
   const bytes = canonicalJSONBytes(payload, options);
   const digest = await getSubtleCrypto().digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest))
+    .map(byte => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+/** SHA-256 digest for a versioned, domain-separated canonical payload. */
+export async function hashDomainSeparatedPayload(
+  domain: string,
+  payload: unknown,
+  options: JCSCanonicalizeOptions = {}
+): Promise<string> {
+  const digest = await getSubtleCrypto().digest(
+    'SHA-256',
+    domainSeparatedCanonicalJSONBytes(domain, payload, options),
+  );
   return Array.from(new Uint8Array(digest))
     .map(byte => byte.toString(16).padStart(2, '0'))
     .join('');

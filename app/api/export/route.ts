@@ -288,13 +288,16 @@ export async function POST(request: NextRequest) {
       };
 
       try {
-        await streamingExport(
+        const metadata = await streamingExport(
           streamingRequest,
           fetcher,
           streamWriter,
           signal,
           { batchSize: 1000, debug: false },
         );
+        if (metadata.error && !metadata.cancelled) {
+          throw new Error(`Export failed: ${metadata.error}`);
+        }
         controller.close();
       } catch (error) {
         console.error('Export error:', error);

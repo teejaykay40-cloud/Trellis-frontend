@@ -90,6 +90,11 @@ The verdict folds to `blocked` > `warning` > `success`.
 
 - The fingerprint is taken over the **canonical (RFC 8785-style) encoding** of
   `{ actorId, environment, operation, payload }` — key order can never change it.
+- New signing or hashing call sites should include a versioned domain such as
+  `trellis.payment.v1` with `domainSeparatedCanonicalJSONBytes()` (or
+  `hashDomainSeparatedPayload()`). This prevents the same JSON body from being
+  replayed as a valid payload in a different protocol context; keep existing
+  receipt fingerprints unchanged for compatibility.
 - The first submission creates the receipt (`status: 'received'`); any duplicate
   submission resolves to the existing receipt (`created: false`). A double-click
   or retried fetch cannot mint a second receipt.

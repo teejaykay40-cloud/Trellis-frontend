@@ -12,11 +12,17 @@ import {
   resolveActor,
   verifyActorToken,
 } from '@/lib/auth/actor';
+import {
+  fingerprintCapabilityRequest,
+  issueCapabilityToken,
+  verifyCapabilityToken,
+} from '@/lib/auth/capability';
 import { parseActionParam, requirePermission } from '@/lib/auth/guard';
 import { ACTIONS, ROLES } from '@/lib/permissions';
 import { GET as permissionsGET } from '@/app/api/permissions/route';
 import { GET as telemetryGET } from '@/app/api/telemetry/session/route';
 import { POST as securityPOST } from '@/app/api/security/route';
+import { POST as capabilityPOST } from '@/app/api/permissions/capability/route';
 import { POST as retentionPOST } from '@/app/api/retention/run/route';
 
 /**
@@ -175,6 +181,65 @@ describe('actor identity', () => {
     it('refuses a secret that is too short to be meaningful', async () => {
       process.env[ACTOR_TOKEN_SECRET_ENV] = 'short';
       await expect(issueActorToken({ id: 'alice', role: 'admin' })).rejects.toThrow(/32/);
+    });
+  });
+
+  describe('action-scoped capability tokens', () => {
+    const action = 'run_retention_cleanup' as const;
+    const request = { dryRun: false, dataClasses: ['telemetry'] };
+
+    it('issues a short-lived token bound to its actor, action, and request', async () => {
+      const requestHash = await fingerprintCapabilityRequest(action, request);
+      const issued = await issueCapabilityToken({ actorId: 'alice', action, requestHash });
+
+      expect(issued.expiresAt).toBe(NOW + 2 * 60 * 1000);
+      await expect(verifyCapabilityToken(issued.token, {
+        actorId: 'alice',
+        action,
+        requestHash,
+      })).resolves.toMatchObject({ ok: true, expiresAt: issued.expiresAt });
+    });
+
+    it('rejects missing, forged, expired, and mismatched capabilities', async () => {
+      const requestHash = await fingerprintCapabilityRequest(action, request);
+      const expectation = { actorId: 'alice', action, requestHash };
+      const issued = await issueCapabilityToken(expectation, { ttlMs: 1000 });
+
+      await expect(verifyCapabilityToken(null, expectation)).resolves.toEqual({
+        ok: false,
+        failure: 'missing_token',
+      });
+      await expect(verifyCapabilityToken(`${issued.token}x`, expectation)).resolves.toMatchObject({
+        ok: false,
+        failure: 'invalid_signature',
+      });
+      await expect(verifyCapabilityToken(issued.token, expectation, { now: NOW + 1000 })).resolves.toEqual({
+        ok: false,
+        failure: 'expired_token',
+      });
+      await expect(verifyCapabilityToken(issued.token, { ...expectation, actorId: 'mallory' })).resolves.toEqual({
+        ok: false,
+        failure: 'actor_mismatch',
+      });
+      const otherRequestHash = await fingerprintCapabilityRequest(action, {
+        dryRun: false,
+        dataClasses: ['audit'],
+      });
+      await expect(verifyCapabilityToken(issued.token, {
+        ...expectation,
+        requestHash: otherRequestHash,
+      })).resolves.toEqual({ ok: false, failure: 'request_mismatch' });
+    });
+
+    it('only issues capabilities after matrix authorization', async () => {
+      const viewerToken = await issueActorToken({ id: 'vic', role: 'viewer' });
+      const request = new NextRequest('https://example.test/api/permissions/capability', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${viewerToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ action, dryRun: false }),
+      });
+      const response = await capabilityPOST(request);
+      expect(response.status).toBe(403);
     });
   });
 });
@@ -339,6 +404,11 @@ describe('route-level enforcement', () => {
         },
         body: JSON.stringify(body),
       });
+    const withCapability = (request: NextRequest, capability: string) => {
+      const headers = new Headers(request.headers);
+      headers.set('x-capability-token', capability);
+      return new NextRequest(request, { headers });
+    };
 
     it('rejects an unauthenticated caller with 401 before reading the body', async () => {
       // Identity is resolved first, so an anonymous caller never reaches
@@ -366,14 +436,61 @@ describe('route-level enforcement', () => {
       expect(body.error.message).toMatch(/confirmation/i);
     });
 
-    it('allows an admin who explicitly asked for a live cleanup', async () => {
+    it('requires a matching capability before a live cleanup', async () => {
       const token = await issueActorToken({ id: 'alice', role: 'admin' });
       const { status, body } = await readStatus(
         await retentionPOST(post(token, { dryRun: false, dataClasses: ['telemetry'] })),
       );
-      expect(status).toBe(200);
-      expect(body.dryRun).toBe(false);
-      expect(body.results).toHaveLength(1);
+      expect(status).toBe(428);
+      expect(body.error).toBe('capability_required');
+    });
+
+    it('issues an exact-request capability that remains valid for bounded retries', async () => {
+      const token = await issueActorToken({ id: 'alice', role: 'admin' });
+      const issueRequest = new NextRequest('https://example.test/api/permissions/capability', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          action: 'run_retention_cleanup',
+          dryRun: false,
+          dataClasses: ['telemetry'],
+        }),
+      });
+      const issued = await readStatus(await capabilityPOST(issueRequest));
+      expect(issued.status).toBe(201);
+      expect(issued.body.expiresAt).toBe(NOW + 2 * 60 * 1000);
+
+      for (let retry = 0; retry < 2; retry += 1) {
+        const request = withCapability(
+          post(token, { dryRun: false, dataClasses: ['telemetry'] }),
+          issued.body.token,
+        );
+        const result = await readStatus(await retentionPOST(request));
+        expect(result.status).toBe(200);
+        expect(result.body.dryRun).toBe(false);
+        expect(result.body.results).toHaveLength(1);
+      }
+    });
+
+    it('rejects a capability when the target request has changed', async () => {
+      const token = await issueActorToken({ id: 'alice', role: 'admin' });
+      const issueRequest = new NextRequest('https://example.test/api/permissions/capability', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          action: 'run_retention_cleanup',
+          dryRun: false,
+          dataClasses: ['telemetry'],
+        }),
+      });
+      const issued = await readStatus(await capabilityPOST(issueRequest));
+      const request = withCapability(
+        post(token, { dryRun: false, dataClasses: ['audit'] }),
+        issued.body.token,
+      );
+      const result = await readStatus(await retentionPOST(request));
+      expect(result.status).toBe(403);
+      expect(result.body.error).toBe('request_mismatch');
     });
   });
 
@@ -435,6 +552,8 @@ describe('route-level enforcement', () => {
       );
       expect(status).toBe(200);
       expect(body.success).toBe(true);
+      expect(body.ledgerEntry).toMatchObject({ sequence: expect.any(Number) });
+      expect(body.ledgerEntry.hash).toMatch(/^[0-9a-f]{64}$/);
     });
 
     it('rejects a contributor reading the audit trail with 403', async () => {
@@ -454,6 +573,15 @@ describe('route-level enforcement', () => {
       );
       expect(status).toBe(200);
       expect(body.success).toBe(true);
+      expect(body.ledger).toMatchObject({
+        schemaVersion: 1,
+        verification: { valid: true },
+      });
+      expect(body.ledger.entries[0]).toMatchObject({
+        category: 'privileged',
+        eventType: 'security.audit.recorded',
+        actorId: 'alice',
+      });
     });
   });
 });

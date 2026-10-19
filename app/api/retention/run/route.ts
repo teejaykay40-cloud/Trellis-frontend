@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { deniedResponse, requireActor } from '@/lib/auth';
+import { fingerprintCapabilityRequest, verifyCapabilityToken } from '@/lib/auth/capability';
 import { checkPermission } from '@/lib/permissions';
 
 /**
@@ -34,6 +35,10 @@ import { checkPermission } from '@/lib/permissions';
  * maintainer can be told what a cleanup *would* remove — but a deliberately
  * unusable one: the delete path is unreachable without explicitly opting out of
  * the dry run.
+ *
+ * A live cleanup additionally requires a short-lived capability from
+ * `POST /api/permissions/capability`, bound to the actor, action, and exact
+ * cleanup request. Dry runs keep the existing actor-token-only contract.
  *
  * `GET` only returns the static policy table, so it stays open.
  */
@@ -170,6 +175,40 @@ export async function POST(request: NextRequest) {
     context: { confirmed: dryRun === false },
   });
   if (!decision.allowed) return deniedResponse(decision);
+
+  if (!dryRun) {
+    const requestHash = await fingerprintCapabilityRequest('run_retention_cleanup', {
+      dryRun,
+      dataClasses: dataClasses ?? null,
+    });
+    const capability = await verifyCapabilityToken(
+      request.headers.get('x-capability-token'),
+      {
+        actorId: identity.actor.id,
+        action: 'run_retention_cleanup',
+        requestHash,
+      },
+    );
+
+    if (!capability.ok) {
+      const status = capability.failure === 'server_misconfigured'
+        ? 500
+        : capability.failure === 'missing_token'
+          ? 428
+          : ['actor_mismatch', 'action_mismatch', 'request_mismatch'].includes(capability.failure)
+            ? 403
+            : 401;
+      return NextResponse.json(
+        {
+          error: capability.failure === 'missing_token' ? 'capability_required' : capability.failure,
+          message: capability.failure === 'missing_token'
+            ? 'A short-lived capability token is required for a live cleanup.'
+            : 'The capability token is invalid for this action.',
+        },
+        { status },
+      );
+    }
+  }
 
   const targets: DataClass[] = dataClasses ?? (Object.keys(POLICY_TABLE) as DataClass[]);
 

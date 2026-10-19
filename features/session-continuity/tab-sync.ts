@@ -13,7 +13,7 @@ import {
 /**
  * Cross-tab session synchronization.
  *
- * The wire format used to be `{ event, payload?: unknown, source, timestamp }`,
+ * The wire format used to be `{ event, payload?: unknown, source, timestamp },
  * where `payload` was unconstrained, so a receiving tab could be handed any
  * shape at all. It is now a versioned domain event: the payload is typed per
  * event name, the version is explicit, and a tab that cannot read an incoming
@@ -27,9 +27,8 @@ export const SESSION_SYNC_CHANNEL = 'trellis-session-sync';
 
 export type SessionSyncEventName = 'WALLET_DISCONNECTED' | 'NETWORK_CHANGED' | 'THEME_MUTATED';
 
-/**
- * A session-sync message is a domain event envelope. `name` is narrowed to the
- * session union so `SessionConflictPrompt` keeps a single discriminant.
+/** A session-sync message is a domain event envelope. `Name` is narrowed to
+ * the session union so `SessionConflictPrompt` keeps a single discriminant.
  */
 export type SessionSyncMessage = DomainEventEnvelope<unknown> & {
   name: SessionSyncEventName;
@@ -39,7 +38,7 @@ export type SessionSyncMessage = DomainEventEnvelope<unknown> & {
 /** Payload type for a specific session event, as enforced by the catalog. */
 export type SessionSyncPayload<TName extends SessionSyncEventName> = EventPayloadFor<TName>;
 
-/** Identifies this tab,so echoed messages can be ignored. */
+/** Identifies this tab, so echoed messages can be ignored. */
 function defaultSource(): string {
   const cryptoRef = globalThis.crypto as Crypto | undefined;
 
@@ -58,11 +57,11 @@ function defaultSource(): string {
  * `null` channel makes delivery a no-op, which is what lets the envelope be
  * built and validated without broadcasting it.
  */
-export function createSessionSyncMessage<TPage extends SessionSyncEventName>(
-  event: TPage,
-  payload: SessionSyncPayload<TPage>,
+export function createSessionSyncMessage<TPayload extends SessionSyncEventName>(
+  event: TPayload,
+  payload: SessionSyncPayload<TPayload>,
   source: string,
-): DomainEventEnvelope<SessionSyncPayload<TPage>> {
+): DomainEventEnvelope<SessionSyncPayload<TPayload>> {
   return publishDomainEvent(event, payload, {
     delivery: createBroadcastDelivery(null),
     source,
@@ -82,6 +81,21 @@ export interface SessionTabSyncOptions {
   onLegacy?: (context: LegacyDomainEventContext, payload: unknown) => void;
 }
 
+/**
+ * Operational edge cases and failure modes for cross-tab sync:
+ *
+ * - Duplicate submissions: the same logical mutation may arrive from multiple
+ *   tabs or be replayed by the browser. Consumers must key on `idOf` or the
+ *   envelope `id` to dedupe; this class delivers every valid envelope and
+ *   does not itself dedupe.
+ * - Stale versions: an envelope from a future or past schema version is routed
+ *   to `onLegacy` and never reaches `subscribe` listeners.
+ * - Retry storms: `publish` throws synchronously on invalid payloads and
+ *   never broadcasts partial data; callers own backoff and idempotency keys.
+ * - Rollback/recovery: close() detaches the channel and clears listeners; a
+ *   reloaded tab re-registers with a fresh source id and re-syncs from the
+ *   server of record rather than relying on in-flight broadcasts.
+ */
 export class SessionTabSync {
   private readonly channel: BroadcastChannel | null;
   private readonly source: string;

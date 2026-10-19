@@ -121,6 +121,10 @@ export interface ExportConfig {
   maxMemoryBytes: number;
   /** Timeout for individual batch processing in milliseconds. */
   batchTimeoutMs: number;
+  /** Number of times to retry a failed batch fetch. */
+  maxRetries: number;
+  /** Delay before retrying a failed batch fetch. */
+  retryDelayMs: number;
   /** Whether to include debug telemetry. */
   debug: boolean;
 }
@@ -193,6 +197,8 @@ const DEFAULT_CONFIG: ExportConfig = {
   batchSize: 1000,
   maxMemoryBytes: 100 * 1024 * 1024, // 100MB
   batchTimeoutMs: 30000, // 30 seconds
+  maxRetries: 2,
+  retryDelayMs: 100,
   debug: false,
 };
 
@@ -291,13 +297,19 @@ export function redactRecord(
   record: PermissionRecord,
   role: Role,
 ): { redacted: Record<string, unknown>; redactedFieldCount: number } {
-  const redacted: Record<string, unknown> = { ...record.data };
+  const redacted: Record<string, unknown> = {};
   let redactedFieldCount = 0;
 
   for (const [fieldName, permission] of record.fieldPermissions) {
+    if (!Object.prototype.hasOwnProperty.call(record.data, fieldName)) {
+      continue;
+    }
+
     if (!canViewField(role, permission.requiredLevel)) {
       redacted[fieldName] = `[REDACTED:${permission.requiredLevel.toUpperCase()}]`;
       redactedFieldCount++;
+    } else {
+      redacted[fieldName] = record.data[fieldName];
     }
   }
 
@@ -324,6 +336,7 @@ export async function processBatch(
   writer: StreamWriter,
   signal: AbortSignal,
   isFirstBatch: boolean,
+  csvHeaders?: string[],
 ): Promise<BatchResult> {
   // Check cancellation before processing
   if (signal.aborted) {
@@ -351,7 +364,7 @@ export async function processBatch(
 
   // Format and write the batch
   try {
-    const chunk = formatBatch(processedRecords, format, isFirstBatch);
+    const chunk = formatBatch(processedRecords, format, isFirstBatch, csvHeaders);
     await writer(chunk);
   } catch (error) {
     return {
@@ -378,6 +391,7 @@ function formatBatch(
   records: Record<string, unknown>[],
   format: ExportFormat,
   isFirstBatch: boolean,
+  csvHeaders?: string[],
 ): string {
   if (records.length === 0) {
     return '';
@@ -395,7 +409,7 @@ function formatBatch(
   if (format === 'csv') {
     if (isFirstBatch) {
       // First batch: include header
-      const headers = Object.keys(records[0]);
+      const headers = csvHeaders ?? Object.keys(records[0]);
       const headerRow = headers.join(',');
       const dataRows = records.map((r) =>
         headers.map((h) => csvEscape(r[h])).join(','),
@@ -403,7 +417,7 @@ function formatBatch(
       return [headerRow, ...dataRows].join('\n') + '\n';
     }
     // Subsequent batches: data only
-    const headers = Object.keys(records[0]);
+    const headers = csvHeaders ?? Object.keys(records[0]);
     const dataRows = records.map((r) =>
       headers.map((h) => csvEscape(r[h])).join(','),
     );
@@ -426,10 +440,43 @@ function csvEscape(value: unknown): string {
     return `'${str}`;
   }
   // Quote if contains comma, quote, or newline
-  if (/["\n,]/.test(str)) {
+  if (/["\r\n,]/.test(str)) {
     return `"${str.replace(/"/g, '""')}"`;
   }
   return str;
+}
+
+async function fetchWithRetry(
+  fetcher: RecordFetcher,
+  offset: number,
+  limit: number,
+  signal: AbortSignal,
+  config: ExportConfig,
+): Promise<PermissionRecord[]> {
+  for (let attempt = 0; ; attempt++) {
+    if (signal.aborted) {
+      return [];
+    }
+
+    try {
+      return await fetcher(offset, limit, signal);
+    } catch (error) {
+      if (attempt >= config.maxRetries || signal.aborted) {
+        throw error;
+      }
+
+      await new Promise<void>((resolve) => {
+        let timer: ReturnType<typeof setTimeout>;
+        const finish = () => {
+          clearTimeout(timer);
+          signal.removeEventListener('abort', finish);
+          resolve();
+        };
+        timer = setTimeout(finish, config.retryDelayMs);
+        signal.addEventListener('abort', finish, { once: true });
+      });
+    }
+  }
 }
 
 // ============================================================================
@@ -476,6 +523,7 @@ export async function streamingExport(
 
   // Build permission map for this export type
   const permissionMap = buildPermissionMap(request.type);
+  const csvHeaders = getFieldPermissions(request.type).map(({ name }) => name);
 
   // Wrap the fetcher to add permission metadata
   const permissionAwareFetcher: RecordFetcher = async (offset, limit, sig) => {
@@ -504,11 +552,18 @@ export async function streamingExport(
       }
 
       // Fetch a batch
-      const records = await permissionAwareFetcher(
+      const records = await fetchWithRetry(
+        permissionAwareFetcher,
         offset,
         effectiveConfig.batchSize,
         signal,
+        effectiveConfig,
       );
+
+      if (signal.aborted) {
+        metadata.cancelled = true;
+        break;
+      }
 
       // If no records, we're done
       if (records.length === 0) {
@@ -523,6 +578,7 @@ export async function streamingExport(
         writer,
         signal,
         isFirstBatch,
+        csvHeaders,
       );
 
       // Update metadata
@@ -577,6 +633,8 @@ export const ExportConfigSchema = z.object({
   batchSize: z.number().int().positive().max(10000),
   maxMemoryBytes: z.number().int().positive(),
   batchTimeoutMs: z.number().int().positive(),
+  maxRetries: z.number().int().min(0).max(5).default(2),
+  retryDelayMs: z.number().int().nonnegative().max(10000).default(100),
   debug: z.boolean(),
 });
 

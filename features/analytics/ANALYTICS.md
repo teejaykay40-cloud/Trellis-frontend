@@ -104,3 +104,5 @@ Tests verify:
 - Laplace samples follow the configured scale and are applied to bounded aggregate reports
 - Reports do not contain event-level identifiers, dimensions, or precise timestamps
 - Daily epsilon budgets stop additional report releases when exhausted
+
+```

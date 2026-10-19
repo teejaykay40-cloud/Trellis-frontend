@@ -5,6 +5,8 @@ This document covers four interconnected systems introduced to address issues
 make the Trellis frontend resilient to interrupted operations, tampered data,
 impossible domain states, and failed schema migrations.
 
+It also defines the cross-service contract map for domain events and integration boundaries — see [Section 7](#7-cross-service-contract-map-domain-events--integration-boundaries).
+
 [i53]: https://github.com/TRELLIS-STELLAR/Trellis-frontend/issues/53
 [i54]: https://github.com/TRELLIS-STELLAR/Trellis-frontend/issues/54
 [i55]: https://github.com/TRELLIS-STELLAR/Trellis-frontend/issues/55
@@ -20,6 +22,7 @@ impossible domain states, and failed schema migrations.
 4. [Migration Safety Framework (Issue #56)](#4-migration-safety-framework-issue-56)
 5. [Running the Tests](#5-running-the-tests)
 6. [Design Decisions and Tradeoffs](#6-design-decisions-and-tradeoffs)
+7. [Cross-Service Contract Map (Domain Events & Integration Boundaries)](#7-cross-service-contract-map-domain-events--integration-boundaries)
 
 ---
 
@@ -113,6 +116,135 @@ if (recoverable.length > 0) {
 - **Automatic cleanup** — `pruneExpired()` removes completed/failed/abandoned operations older than `retentionMs` (default 7 days).
 
 ---
+
+## 7. Cross-Service Contract Map (Domain Events & Integration Boundaries)
+
+This section is the canonical contract map for every domain event that crosses
+a service boundary in the Trellis frontend.  It enumerates each producer,
+consumer, required payload field, version rule, and allowed failure behavior.
+It is the source of truth for integration reviews and is enforced by
+`tests/__tests__/domain-events-contract.test.ts`.
+
+### 7.1 Event envelope
+
+Every domain event MUST use the following envelope.  Fields marked **required**
+are validated at emit time; missing required fields cause the emit to throw
+`DomainEventContractError` (see §7.5).
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `eventId` | `string` (UUID v4) | yes | Unique per emission; used for consumer-side idempotency |
+| `eventName` | `string` | yes | Stable identifier, `snake_case`, e.g. `agent.minted` |
+| `eventVersion` | `string` (`MAJOR.MINOR`) | yes | See §7.4 for version rules |
+| `occurredAt` | ISO-8601 `string` | yes | Producer clock; consumers MUST NOT reorder by this alone |
+| `correlationId` | `string` | yes | Ties events to a `RecoverableOperation` (see §1) |
+| `producer` | `'web' \| 'api' \| 'worker' \| 'contract'` | yes | Origin service |
+| `payload` | `object` | yes | Event-specific; see §7.2 |
+| `schemaHash` | `string` (hex) | yes | SHA-256 of the canonical payload schema; see §7.4 |
+
+### 7.2 Producer / consumer matrix
+
+Each row is a contract.  "Required payload fields" lists the minimum set that
+consumers may rely on; additional fields are additive and MUST NOT be treated
+as required by consumers.
+
+| Event | Producer | Consumers | Required payload fields | Failure behavior |
+|---|---|---|---|---|
+| `agent.minted` | `web` | `api`, `worker` | `agentId`, `ownerPublicKey`, `capabilities[]` | Retry with backoff; on 3 failures, mark operation `paused` and surface recovery banner |
+| `agent.updated` | `web` | `api` | `agentId`, `changedFields[]`, `before`, `after` | Best-effort; log and continue; history chain (§2) is authoritative |
+| `wallet.connected` | `web` | `api` | `publicKey`, `network` | Non-blocking; UI proceeds offline-first |
+| `wallet.disconnected` | `web` | `api` | `publicKey`, `reason` | Non-blocking |
+| `delegation.granted` | `web` | `api`, `contract` | `delegationId`, `grantor`, `grantee`, `permissions[]` | Retry; on chain failure, revert local state and record `chain_break` in history |
+| `delegation.revoked` | `web` | `api`, `contract` | `delegationId`, `revokedBy` | Retry; invariant I-11 (§3) must hold after apply |
+| `stake.created` | `web` | `api`, `contract` | `stakeId`, `userId`, `amount`, `asset` | Retry; invariant I-08 (§3) must hold |
+| `stake.released` | `web` | `api`, `contract` | `stakeId`, `releasedAt` | Retry |
+| `import.batch.completed` | `worker` | `web`, `api` | `batchId`, `importedCount`, `skippedCount`, `errors[]` | Idempotent by `batchId`; duplicates ignored |
+| `import.batch.failed` | `worker` | `web` | `batchId`, `reason`, `rollbackGuidance` | Surface to user; do not auto-retry |
+| `migration.applied` | `api` | `web` | `migrationId`, `version`, `affectedCount` | Informational; web refreshes caches |
+| `migration.validation_failed` | `api` | `web` | `migrationId`, `errors[]`, `rollbackNote` | Block further migrations; surface to maintainers |
+
+### 7.3 Integration boundaries
+
+The following boundaries are the only sanctioned crossing points between
+services.  Any new event that crosses a boundary MUST be added to §7.2 before
+it is emitted in production code.
+
+| Boundary | Direction | Transport | Delivery guarantee | Ordering |
+|---|---|---|---|---|
+| `web → api` | outbound | HTTPS POST `/api/events` | at-least-once | per `correlationId` |
+| `web → contract` | outbound | Stellar transaction | at-most-once (chain) | chain order |
+| `api → web` | inbound | SSE `/api/events/stream` | at-least-once | per `correlationId` |
+| `worker → web` | inbound | SSE `/api/events/stream` | at-least-once | per `batchId` |
+| `api → worker` | internal | queue | at-least-once | per `batchId` |
+
+Consumers MUST be idempotent on `eventId` (or `batchId` for import events).
+Duplicate deliveries are expected and are not an error condition.
+
+### 7.4 Version rules
+
+`eventVersion` follows `MAJOR.MINOR`:
+
+- **MINOR** bump: additive fields only.  Producers MAY add fields; consumers
+  MUST ignore unknown fields.  No coordination required.
+- **MAJOR** bump: removal, rename, or type change of a required field.  A MAJOR
+  bump requires a migration plan (§4) and a dual-emit window during which the
+  producer emits both versions.  Consumers MUST declare which MAJOR versions
+  they accept.
+- `schemaHash` MUST change whenever the canonical payload schema changes.  A
+  mismatch between producer `schemaHash` and the consumer's registered hash is
+  a contract violation and MUST be logged with `eventName` and `eventVersion`.
+
+### 7.5 Allowed failure behavior
+
+| Failure | Allowed? | Required handling |
+|---|---|---|
+| Unknown `eventName` | yes | Log at `warn`; do not throw; do not retry |
+| Unknown extra payload field | yes | Ignore silently |
+| Missing required payload field | no | Throw `DomainEventContractError`; do not emit |
+| `schemaHash` mismatch | no | Log at `error`; drop event; alert maintainers |
+| Duplicate `eventId` | yes | Ignore (idempotent consumer) |
+| Out-of-order delivery within `correlationId` | no | Buffer up to 30s; if still out of order, log and apply in arrival order |
+| Consumer unavailable | yes | Retry with exponential backoff; after 3 failures mark operation `paused` (§1) |
+
+### 7.6 Operational edge cases
+
+- **Offline PWA**: events emitted while offline are queued in
+  `trellis:events:outbox` and flushed on reconnect.  Queue is bounded at 500
+  entries; overflow drops the oldest non-critical events and logs a warning.
+- **Clock skew**: `occurredAt` is advisory.  Consumers MUST NOT use it for
+  ordering decisions; use `correlationId` + arrival order instead.
+- **Partial batch**: `import.batch.completed` with `errors.length > 0` is a
+  success-with-warnings, not a failure.  UI MUST show the error count.
+- **Migration in progress**: while `migration.applied` is pending, web MUST
+  serve cached reads and MUST NOT emit `agent.updated` for affected records.
+
+### 7.7 Rollback / recovery
+
+1. **Producer bug**: disable the producer via the feature flag
+   `trellis.events.<eventName>.enabled=false`; queued events in the outbox are
+   drained and discarded.  No consumer changes required.
+2. **Consumer bug**: consumers are additive; roll back the consumer deploy.
+   Producers continue emitting; events are buffered by the transport for up to
+   24h.
+3. **Contract violation (MAJOR)**: follow the migration plan in §4.  Emit both
+   versions during the dual-emit window; after all consumers report the new
+   version in telemetry for 7 days, remove the old emit.
+4. **Schema hash mismatch**: stop the producer, re-derive `schemaHash` from the
+   canonical schema, redeploy producer and consumers together.
+
+### 7.8 Verification
+
+The contract map is enforced by
+`tests/__tests__/domain-events-contract.test.ts`, which asserts:
+
+- every event in §7.2 has a registered producer and at least one consumer;
+- every required payload field is present in the emitted envelope;
+- `schemaHash` is stable for a given `(eventName, eventVersion)`;
+- unknown events and unknown fields do not throw;
+- missing required fields throw `DomainEventContractError`.
+
+Run with:
+
 
 ## 2. Tamper-Evident Change History (Issue #53)
 

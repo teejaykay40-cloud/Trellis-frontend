@@ -53,6 +53,7 @@ export type Scope = (typeof SCOPES)[number];
  * | `view_audit_logs`       | `app/api/security` (audit-history action)              |
  * | `manage_security`       | `app/api/security` (record-audit action)               |
  * | `run_retention_cleanup` | `app/api/retention/run` — irreversible data deletion  |
+ * | `repair_records`        | reconciliation repair job — mutates derived records |
  * | `retry_operation`       | `lib/policy-engine.ts`, which declared it with no entry|
  * | `create_invitation` …   | `lib/invitations.ts` lifecycle                         |
  * | `view_permissions`      | `app/api/permissions`                                  |
@@ -82,6 +83,7 @@ export const ACTIONS = [
   'view_audit_logs',
   'manage_security',
   'run_retention_cleanup',
+  'repair_records',
   'create_invitation',
   'revoke_invitation',
   'accept_invitation',
@@ -379,6 +381,16 @@ const MATRIX: Record<Action, ActionDefinition> = {
       // intentionally no maintainer path. The `requires_confirmation` condition
       // is what a handler satisfies by honouring an explicit `dryRun: false` in
       // the request body: a dry run alone is never enough to delete anything.
+      admin: { scope: 'global', conditions: [{ type: 'requires_confirmation' }] },
+      maintainer: DENY,
+      contributor: DENY,
+      viewer: DENY,
+      guest: DENY,
+    },
+  },
+  repair_records: {
+    description: 'Repair orphaned or inconsistent derived records',
+    grants: {
       admin: { scope: 'global', conditions: [{ type: 'requires_confirmation' }] },
       maintainer: DENY,
       contributor: DENY,

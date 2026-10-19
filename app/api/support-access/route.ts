@@ -14,6 +14,13 @@ import {
   recordImpersonationAction,
   startImpersonation,
 } from '@/lib/impersonation';
+import {
+  buildEvidenceBundle,
+  bundleFilename,
+  bundleToJson,
+} from '@/features/activity-timeline/redaction/evidence-bundle';
+import { redactTimelineEvents } from '@/features/activity-timeline/redaction/redactor';
+import type { TimelineEvent } from '@/features/activity-timeline/types';
 
 export const runtime = 'nodejs';
 
@@ -47,18 +54,27 @@ const AuditSchema = z.object({
   confirm: z.literal(true),
 });
 
+const EvidenceBundleSchema = z.object({
+  action: z.literal('evidence-bundle'),
+  sessionId: z.string().min(1).max(200),
+  reason: z.string().trim().min(3).max(500),
+  confirm: z.literal(true),
+});
+
 const RequestSchema = z.discriminatedUnion('action', [
   StartSchema,
   EndSchema,
   AuthorizeSchema,
   AuditSchema,
+  EvidenceBundleSchema,
 ]);
 
 function permissionFailure(
   action: 'impersonate_user' | 'view_audit_logs',
   actor: { id: string; role: 'guest' | 'viewer' | 'contributor' | 'maintainer' | 'admin' },
   confirmed: boolean,
-) {
+)
+{
   const decision = checkPermission(action, {
     role: actor.role,
     actorId: actor.id,
@@ -74,6 +90,31 @@ function ownedSession(sessionId: string, actorId: string) {
   if (!session || session.adminId !== actorId) return null;
   return session;
 }
+
+/** Map an impersonation audit entry to a timeline event for bundle export. */
+const auditEntryToTimelineEvent = (
+  entry: ReturnType<typeof getImpersonationAuditLog>[number],
+  sessionId: string,
+): TimelineEvent => {
+  const outcome = entry.outcome ?? 'recorded';
+  const type: TimelineEvent['type'] =
+    outcome === 'blocked' ? 'claim_rejected' : 'claim_settled';
+  return {
+    id: `${sessionId}:${entry.sequence ?? entry.timestamp}`,
+    userId: entry.actorId ?? 'support-session',
+    type,
+    visibility: 'maintainer_only',
+    timestamp: typeof entry.timestamp === 'number' ? entry.timestamp : Date.parse(String(entry.timestamp)),
+    title: `Support action ${outcome}`,
+    description: `Session ${sessionId} attempted ${entry.action ?? 'unknown'} on ${entry.resource ?? 'unknown'} (${outcome}).`,
+    metadata: {
+      sessionId,
+      action: entry.action,
+      resource: entry.resource,
+      outcome,
+    },
+  };
+};
 
 export async function GET(request: NextRequest) {
   const identity = await requireActor(request);
@@ -107,8 +148,8 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const denial = permissionFailure('impersonate_user', identity.actor, parsed.data.confirm);
-  if (denial) return denial;
+  const denied = permissionFailure('impersonate_user', identity.actor, parsed.data.confirm);
+  if (denied) return denied;
 
   try {
     if (parsed.data.action === 'start') {
@@ -149,6 +190,30 @@ export async function POST(request: NextRequest) {
 
     if (parsed.data.action === 'audit') {
       return NextResponse.json({ events: getImpersonationAuditLog(parsed.data.sessionId) });
+    }
+
+    if (parsed.data.action === 'evidence-bundle') {
+      // Build a privacy-preserving bundle from the session's audit log.
+      // The audit log is already scrubbed of provider error text by the
+      // manager, but we redact again here so the bundle is safe even if
+      // the manager changes or a resource string embeds a token.
+      const auditEvents = getImpersonationAuditLog(parsed.data.sessionId);
+      const timelineEvents = auditEvents.map((entry) =>
+        auditEntryToTimelineEvent(entry, parsed.data.sessionId),
+      );
+      const redacted = redactTimelineEvents(timelineEvents).value;
+      const now = new Date();
+      const bundle = await buildEvidenceBundle(redacted, {
+        now,
+        correlationId: parsed.data.sessionId,
+        subject: `user ${session.targetUserId}`,
+        reason: parsed.data.reason,
+      });
+      return NextResponse.json({
+        bundle,
+        filename: bundleFilename(now),
+        contents: bundleToJson(bundle),
+      });
     }
 
     const allowed = canPerformActionInImpersonation(
